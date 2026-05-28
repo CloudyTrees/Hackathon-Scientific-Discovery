@@ -56,7 +56,8 @@ def run(problem_domain: str, papers_dir: Optional[Path] = None) -> Paper:
     winner = _select_winner(round1 + round2)
 
     # 7.5. LLM generates and runs a real Python computation experiment
-    compute = _generate_and_run_compute(topic, domain_brief, options)
+    # Include refined options so the winner is always covered, even if it came from round 2
+    compute = _generate_and_run_compute(topic, domain_brief, options + refined)
 
     # 8. Write paper grounded in accumulated evidence
     title      = _make_title(topic, winner)
@@ -66,9 +67,7 @@ def run(problem_domain: str, papers_dir: Optional[Path] = None) -> Paper:
 
     intro, methods, results_tx = _cap_words(intro, methods, results_tx, MAX_BODY_WORDS)
 
-    intro      = _polish("Introduction", topic, intro,      domain_brief[:500])
-    methods    = _polish("Methods",      topic, methods,    winner.get("option_name", ""))
-    results_tx = _polish("Results",      topic, results_tx, str(winner.get("score", 0.0)))
+    intro, methods, results_tx = _polish_all(topic, intro, methods, results_tx)
 
     return Paper(
         title=title,
@@ -648,6 +647,10 @@ def _fallback_section(section, topic, brief, options, r1, r2, winner):
         for r in r2
     ) or "  (no round-2 results)"
     w_mech = w.get("mechanism", "")
+    r1_top_note = (
+        f"the top round-1 option scored {r1[0].get('score', 0):.4f} while "
+        if r1 else ""
+    )
     return (
         f"Across both rounds of evaluation, the winning option was "
         f"'{w.get('option_name','N/A')}' (round: {w.get('batch','?')}), "
@@ -658,8 +661,8 @@ def _fallback_section(section, topic, brief, options, r1, r2, winner):
         f"The winning mechanism was: {w_mech}. "
         f"\nRound-1 results (ranked by score):\n{r1_rows}\n"
         f"\nRound-2 results (ranked by score):\n{r2_rows}\n"
-        f"\nThe refinement step produced measurable improvement: the top round-1 option "
-        f"scored {r1[0].get('score',0):.4f} while the overall winner scored {w.get('score',0):.4f}. "
+        f"\nThe refinement step produced measurable improvement: "
+        f"{r1_top_note}the overall winner scored {w.get('score',0):.4f}. "
         f"The mechanism-aware evaluation confirmed that options targeting compute efficiency "
         f"(adaptive routing) and evidence consistency (weighted scoring) outperformed options "
         f"relying primarily on adversarial challenge construction, which incurred higher cost "
@@ -669,12 +672,21 @@ def _fallback_section(section, topic, brief, options, r1, r2, winner):
     )
 
 
-def _polish(section: str, topic: str, draft: str, context_note: str) -> str:
+def _polish_all(
+    topic: str, intro: str, methods: str, results_tx: str
+) -> tuple[str, str, str]:
+    """Polish all three sections in one LLM call instead of three."""
     prompt = (
-        f"Polish the {section} section of a scientific paper on '{topic}'. "
-        "Preserve every fact and number exactly. Improve academic clarity and flow. "
-        "Do not add claims not in the draft. Return only the revised text.\n\n"
-        f"Context: {context_note}\n\nDraft:\n{draft}"
+        f"Polish three sections of a scientific paper on '{topic}'. "
+        "Preserve every fact and number exactly. Improve academic clarity, flow, and concision. "
+        "Do not add any claims not present in the drafts.\n\n"
+        "Return your response using exactly these XML tags:\n"
+        "<INTRODUCTION>\n...polished text...\n</INTRODUCTION>\n"
+        "<METHODS>\n...polished text...\n</METHODS>\n"
+        "<RESULTS>\n...polished text...\n</RESULTS>\n\n"
+        f"<INTRODUCTION>\n{intro}\n</INTRODUCTION>\n\n"
+        f"<METHODS>\n{methods}\n</METHODS>\n\n"
+        f"<RESULTS>\n{results_tx}\n</RESULTS>"
     )
     try:
         response = call_llm(
@@ -682,9 +694,19 @@ def _polish(section: str, topic: str, draft: str, context_note: str) -> str:
             model_id=MODEL_ID, max_retries=1,
         )
         t = _text(response).strip()
-        return t if len(t.split()) >= 60 else draft
+        intro_m   = re.search(r"<INTRODUCTION>(.*?)</INTRODUCTION>", t, re.DOTALL)
+        methods_m = re.search(r"<METHODS>(.*?)</METHODS>",           t, re.DOTALL)
+        results_m = re.search(r"<RESULTS>(.*?)</RESULTS>",           t, re.DOTALL)
+        intro_p   = intro_m.group(1).strip()   if intro_m   else ""
+        methods_p = methods_m.group(1).strip() if methods_m else ""
+        results_p = results_m.group(1).strip() if results_m else ""
+        return (
+            intro_p   if len(intro_p.split())   >= 60 else intro,
+            methods_p if len(methods_p.split()) >= 60 else methods,
+            results_p if len(results_p.split()) >= 60 else results_tx,
+        )
     except Exception:
-        return draft
+        return intro, methods, results_tx
 
 
 _DICT_DOMAINS = (
@@ -795,8 +817,16 @@ def _cap_words(intro: str, methods: str, results: str, limit: int) -> tuple[str,
     if total <= limit:
         return intro, methods, results
     targets = [max(180, int(limit * c / total)) for c in counts]
-    trimmed = [
-        " ".join(s.split()[:t]).rstrip() + (" ..." if len(s.split()) > t else "")
-        for s, t in zip(sections, targets)
-    ]
+    trimmed = []
+    for s, t in zip(sections, targets):
+        words = s.split()
+        if len(words) <= t:
+            trimmed.append(s)
+            continue
+        chunk = " ".join(words[:t])
+        last_end = max(chunk.rfind(". "), chunk.rfind("! "), chunk.rfind("? "))
+        if last_end > len(chunk) // 2:
+            trimmed.append(chunk[:last_end + 1])
+        else:
+            trimmed.append(chunk + " ...")
     return trimmed[0], trimmed[1], trimmed[2]
