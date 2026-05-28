@@ -687,18 +687,50 @@ def _polish(section: str, topic: str, draft: str, context_note: str) -> str:
         return draft
 
 
+_DICT_DOMAINS = (
+    "merriam-webster.com", "dictionary.com", "thesaurus.com",
+    "wiktionary.org", "yourdictionary.com", "vocabulary.com",
+    "lexico.com", "collinsdictionary.com", "britannica.com",
+)
+
+_TRIVIAL_PREFIXES = (
+    "definition of ", "what is ", "meaning of ", "define ",
+    "glossary of ", "encyclopedia ",
+)
+
+
+def _is_useful_reference(hit: dict) -> bool:
+    url   = hit.get("url",   "").lower()
+    title = hit.get("title", "").lower().strip()
+    if any(d in url for d in _DICT_DOMAINS):
+        return False
+    if any(title.startswith(p) for p in _TRIVIAL_PREFIXES):
+        return False
+    return bool(hit.get("title") or hit.get("url"))
+
+
 def _build_references(hits: list[dict]) -> str:
     lines = [
         "- Nair et al. Flow-of-Options: Diversified and Improved LLM Reasoning by Thinking "
         "Through Options. ICML 2025. arXiv:2502.12929. https://arxiv.org/abs/2502.12929",
     ]
-    for h in hits[:6]:
+    for h in hits:
+        if not _is_useful_reference(h):
+            continue
         title = h.get("title", "").strip()
-        url   = h.get("url", "").strip()
-        if title or url:
-            entry = f"- {title} ({url})".strip(" ()")
-            if entry not in lines:
-                lines.append(entry)
+        url   = h.get("url",   "").strip()
+        if title and url:
+            entry = f"- {title} ({url})"
+        elif title:
+            entry = f"- {title}"
+        elif url:
+            entry = f"- {url}"
+        else:
+            continue
+        if entry not in lines:
+            lines.append(entry)
+        if len(lines) >= 8:
+            break
     return "\n".join(lines)
 
 
