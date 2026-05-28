@@ -59,11 +59,14 @@ def run(problem_domain: str, papers_dir: Optional[Path] = None) -> Paper:
     # Include refined options so the winner is always covered, even if it came from round 2
     compute = _generate_and_run_compute(topic, domain_brief, options + refined)
 
+    # 7.7. Pre-writing: LLM reasons about what the results actually mean before drafting
+    narrative = _synthesise_narrative(topic, domain_brief, round1, round2, winner, compute)
+
     # 8. Write paper grounded in accumulated evidence
     title      = _make_title(topic, winner)
-    intro      = _write_section("Introduction", topic, domain_brief, options, refined, round1, round2, winner, raw_hits, compute)
-    methods    = _write_section("Methods",       topic, domain_brief, options, refined, round1, round2, winner, raw_hits, compute)
-    results_tx = _write_section("Results",       topic, domain_brief, options, refined, round1, round2, winner, raw_hits, compute)
+    intro      = _write_section("Introduction", topic, domain_brief, options, refined, round1, round2, winner, raw_hits, compute, narrative)
+    methods    = _write_section("Methods",       topic, domain_brief, options, refined, round1, round2, winner, raw_hits, compute, narrative)
+    results_tx = _write_section("Results",       topic, domain_brief, options, refined, round1, round2, winner, raw_hits, compute, narrative)
 
     intro, methods, results_tx = _cap_words(intro, methods, results_tx, MAX_BODY_WORDS)
 
@@ -478,6 +481,51 @@ def _make_title(topic: str, winner: dict) -> str:
     return f"Open-Domain Option Refinement for {' '.join(w.capitalize() for w in topic.split())}"
 
 
+def _synthesise_narrative(
+    topic: str,
+    domain_brief: str,
+    round1: list[dict],
+    round2: list[dict],
+    winner: dict,
+    compute: dict,
+) -> str:
+    """LLM reasons about what the results mean before any section is written."""
+    compute_note = ""
+    if compute and isinstance(compute, dict) and compute.get("results"):
+        best = max(compute["results"], key=lambda r: r.get("mean_quality", 0))
+        compute_note = (
+            f"\nCompute experiment: '{best.get('option_name','?')}' achieved the highest "
+            f"code-measured quality ({best.get('mean_quality', 0):.4f})."
+        )
+    prompt = (
+        f"You are analyzing results from a comparative study on: '{topic}'.\n\n"
+        f"Domain context:\n{domain_brief[:600]}\n\n"
+        f"Round-1 evaluation:\n{_results_table(round1)}\n\n"
+        f"Round-2 (after refinement):\n{_results_table(round2)}\n\n"
+        f"Winner: {winner.get('option_name','?')}\n"
+        f"Mechanism: {winner.get('mechanism','')}\n"
+        f"Score={winner.get('score',0):.4f}, accuracy={winner.get('macro_accuracy',0):.4f}, "
+        f"stability={winner.get('macro_stability',0):.4f}, cost={winner.get('macro_cost',0):.4f}"
+        f"{compute_note}\n\n"
+        "Reason through the following in 150–200 words (internal analysis, not paper prose):\n"
+        "1. Why mechanistically did the winner outperform the alternatives?\n"
+        "2. What does the scoring pattern reveal about the domain's core challenges?\n"
+        "3. What changed between round 1 and round 2, and why does that matter scientifically?\n"
+        "4. What is the single most important takeaway for the field?\n"
+        "Be specific. Reference exact numbers."
+    )
+    try:
+        response = call_llm(
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            model_id=MODEL_ID,
+            max_retries=1,
+        )
+        t = _text(response).strip()
+        return t if len(t.split()) >= 50 else ""
+    except Exception:
+        return ""
+
+
 def _write_section(
     section: str,
     topic: str,
@@ -489,8 +537,9 @@ def _write_section(
     winner: dict,
     hits: list[dict],
     compute: dict = None,
+    narrative: str = "",
 ) -> str:
-    """Single LLM call per section with all relevant evidence passed in."""
+    """Single LLM call per section, grounded in evidence and pre-reasoned narrative."""
 
     option_names = ", ".join(o.get("option_name", "") for o in options)
     r1_table = _results_table(round1)
@@ -499,20 +548,21 @@ def _write_section(
     w = winner
 
     if section == "Introduction":
+        narrative_note = f"\nKey findings from this study:\n{narrative}\n" if narrative else ""
         prompt = (
-            f"Write the Introduction (200–360 words) for a scientific paper on '{topic}'.\n\n"
-            "Requirements:\n"
-            "- Open with the core problem as revealed by real search evidence\n"
-            "- Describe what existing approaches miss (use the domain brief)\n"
-            "- Motivate the Flow-of-Options approach: why exploring multiple independent "
-            "research directions is the right strategy here\n"
-            "- State the paper's contribution (two-round option generation + refinement study)\n"
-            "- Name the 4 research directions explored\n"
-            "- End with one sentence paper outline\n\n"
-            f"Domain brief:\n{domain_brief}\n\n"
-            f"Research options explored: {option_names}\n"
-            f"Background references available: {bib_titles or 'web search results'}\n\n"
-            "Write only the section text. No heading."
+            f"You are writing the Introduction of a rigorous scientific paper on '{topic}'.\n\n"
+            f"Evidence from real literature search:\n{domain_brief}\n\n"
+            f"Research directions explored: {option_names}\n"
+            f"Background sources: {bib_titles or 'web search results'}"
+            f"{narrative_note}\n\n"
+            "Write a compelling Introduction (250–350 words) as a sustained scientific argument.\n"
+            "Open with the fundamental challenge — why this problem is hard and why it matters.\n"
+            "Build toward a specific gap: what are current approaches systematically failing to address?\n"
+            "Motivate why exploring and comparing multiple independent hypotheses is the right \n"
+            "scientific strategy for this domain in particular.\n"
+            "Close with a precise statement of what this study contributes and what the results show.\n"
+            "Do NOT open with 'In this paper'. Do NOT use bullet points or numbered lists. "
+            "Write coherent prose. Ground every claim in the domain evidence above. No heading."
         )
     elif section == "Methods":
         q_by_opt = "\n".join(
@@ -521,19 +571,22 @@ def _write_section(
             for o in options
         )
         prompt = (
-            f"Write the Methods (200–360 words) for a scientific paper on '{topic}'.\n\n"
-            "Must describe:\n"
-            "1. Domain study phase: web search + LLM synthesis into domain brief\n"
-            "2. Option generation: how 4 options were derived from specific open questions in the brief\n"
-            "3. Evaluation protocol: mechanism-aware simulated experiments, 40 trials each, "
-            "composite Pareto score (1.55×accuracy + 1.15×stability − 0.55×cost − 0.07×steps)\n"
-            "4. Refinement phase: LLM failure analysis on round-1 results, 2 improved options\n"
-            "5. Winner selection\n"
-            "6. Compute experiment: an LLM-generated Python script implemented each option's mechanism "
-            "on synthetic domain data and ran real calculations to produce quantitative per-option results\n\n"
-            f"Round-1 options and mechanisms:\n{q_by_opt}\n"
-            f"Round-2 had {len(refined)} refined options.\n\n"
-            "Write only the section text. No heading. Be specific, not generic."
+            f"You are writing the Methods section of a rigorous scientific paper on '{topic}'.\n\n"
+            f"The study evaluated {len(options)} research hypotheses, each targeting a distinct open question:\n"
+            f"{q_by_opt}\n"
+            f"A refinement round then produced {len(refined)} improved hypotheses.\n\n"
+            "Write a Methods section (220–340 words) that reads as rigorous scientific methodology, "
+            "not as a system walkthrough.\n"
+            "Explain why these specific hypotheses were chosen — what scientific logic drove the selection?\n"
+            "Justify the composite evaluation score (accuracy, stability, cost, reasoning steps) "
+            "in terms of what genuinely matters for this domain.\n"
+            "Describe the refinement round as deliberate scientific iteration: how does analyzing "
+            "failure modes sharpen hypothesis quality?\n"
+            "Explain what the compute experiment adds: why does running real executable code on "
+            "synthetic domain data go beyond simulated scoring alone?\n"
+            "Every methodological choice must have an explicit scientific rationale. "
+            "Write as if justifying to a skeptical peer reviewer. "
+            "Coherent prose only — no bullet lists, no numbered steps. No heading."
         )
     else:  # Results
         compute_rows = ""
@@ -544,25 +597,29 @@ def _write_section(
                 for r in compute["results"]
             )
             compute_rows = f"\n\nCompute experiment results (Python code ran on synthetic domain data):\n{rows}"
+        narrative_note = f"\nPre-analysis of findings:\n{narrative}\n" if narrative else ""
         prompt = (
-            f"Write the Results (260–420 words) for a scientific paper on '{topic}'.\n\n"
-            "Must:\n"
-            "- Report round-1 results with exact numbers from the table\n"
-            "- Describe what the refinement step changed and why (reference mechanism differences)\n"
-            "- Report round-2 results and compare to round-1 top\n"
-            "- Identify the winner, explain what made it best in terms of the domain problem\n"
-            "- If compute experiment results are provided, cite them alongside the Pareto scores\n"
-            "- Connect the empirical pattern to the domain brief challenges\n"
-            "- Note any unexpected findings or limitations\n\n"
-            f"Round-1 results:\n{r1_table}\n\n"
-            f"Round-2 results:\n{r2_table}\n\n"
-            f"Winner: {w.get('option_name','N/A')} (batch={w.get('batch','')}, "
-            f"score={w.get('score',0)}, acc={w.get('macro_accuracy',0)}, "
-            f"stab={w.get('macro_stability',0)}, cost={w.get('macro_cost',0)}, "
-            f"steps={w.get('macro_steps',0)})\n"
-            f"{compute_rows}\n\n"
-            f"Domain brief excerpt: {domain_brief[:350]}\n\n"
-            "Write only the section text. No heading. Preserve all exact numbers."
+            f"You are writing the Results section of a rigorous scientific paper on '{topic}'.\n\n"
+            f"Round-1 evaluation:\n{r1_table}\n\n"
+            f"Round-2 (after refinement):\n{r2_table}\n\n"
+            f"Winning approach: {w.get('option_name','N/A')}\n"
+            f"Mechanism: {w.get('mechanism','')}\n"
+            f"Score={w.get('score',0):.4f}, accuracy={w.get('macro_accuracy',0):.4f}, "
+            f"stability={w.get('macro_stability',0):.4f}, cost={w.get('macro_cost',0):.4f}"
+            f"{compute_rows}"
+            f"{narrative_note}\n\n"
+            f"Domain context: {domain_brief[:400]}\n\n"
+            "Write a Results section (280–420 words) that scientifically interprets the findings.\n"
+            "Lead with the most important finding — not just 'the winner was X' but what it reveals \n"
+            "about the structure of the problem.\n"
+            "Explain mechanistically WHY the winning approach outperformed the alternatives: "
+            "what does this tell us about the domain's core challenge?\n"
+            "Analyze what changed between round 1 and round 2, and what that implies scientifically.\n"
+            "If compute results are available, use them to triangulate and validate the evaluation.\n"
+            "Identify any surprising or counterintuitive results and explain their significance.\n"
+            "Every claim must be grounded in the numbers above. "
+            "Write as scientific analysis, not as a description of tables. "
+            "No bullet points. No numbered lists. No heading. Cite exact numbers."
         )
     try:
         response = call_llm(
