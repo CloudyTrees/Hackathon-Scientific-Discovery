@@ -73,7 +73,7 @@ def extract_code_from_llm_response(text: str) -> str:
     # No code blocks found - check if this looks like raw Python code
     # Simple heuristic: if it contains common Python keywords and no markdown formatting
     python_indicators = ['import ', 'def ', 'class ', 'if __name__', 'print(', 'return ']
-    markdown_indicators = ['```', '##', '**', '*Note:', 'This code', 'Example usage']
+    markdown_indicators = ['```', '## ', '*Note:', 'This code', 'Example usage']
 
     has_python = any(indicator in text for indicator in python_indicators)
     has_markdown = any(indicator in text for indicator in markdown_indicators)
@@ -91,7 +91,7 @@ def extract_code_from_llm_response(text: str) -> str:
 
         for line in lines:
             # Skip obvious prose/markdown lines
-            if any(line.strip().startswith(marker) for marker in ['#', '*', '-', '>', 'Note:', 'This ', 'The ']):
+            if any(line.strip().startswith(marker) for marker in ['## ', '*', '-', '>', 'Note:', 'This ', 'The ']):
                 in_code_section = False
                 continue
 
