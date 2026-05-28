@@ -55,11 +55,14 @@ def run(problem_domain: str, papers_dir: Optional[Path] = None) -> Paper:
     # 7. Pareto winner
     winner = _select_winner(round1 + round2)
 
+    # 7.5. LLM generates and runs a real Python computation experiment
+    compute = _generate_and_run_compute(topic, domain_brief, options)
+
     # 8. Write paper grounded in accumulated evidence
     title      = _make_title(topic, winner)
-    intro      = _write_section("Introduction", topic, domain_brief, options, refined, round1, round2, winner, raw_hits)
-    methods    = _write_section("Methods",       topic, domain_brief, options, refined, round1, round2, winner, raw_hits)
-    results_tx = _write_section("Results",       topic, domain_brief, options, refined, round1, round2, winner, raw_hits)
+    intro      = _write_section("Introduction", topic, domain_brief, options, refined, round1, round2, winner, raw_hits, compute)
+    methods    = _write_section("Methods",       topic, domain_brief, options, refined, round1, round2, winner, raw_hits, compute)
+    results_tx = _write_section("Results",       topic, domain_brief, options, refined, round1, round2, winner, raw_hits, compute)
 
     intro, methods, results_tx = _cap_words(intro, methods, results_tx, MAX_BODY_WORDS)
 
@@ -314,6 +317,68 @@ print("EVAL_END")
 
 
 # ---------------------------------------------------------------------------
+# Step 4.5: LLM generates and runs a real Python computation experiment
+# ---------------------------------------------------------------------------
+
+def _generate_and_run_compute(topic: str, domain_brief: str, options: list[dict]) -> dict:
+    """Ask LLM to write a Python experiment script, run it, return per-option metrics."""
+    opt_lines = "\n".join(
+        f"- {o.get('option_name','')}: hypothesis={o.get('hypothesis','')[:120]}; "
+        f"mechanism={o.get('mechanism','')[:120]}"
+        for o in options
+    )
+    prompt = (
+        f"Write a self-contained Python script that runs a controlled experiment for the research topic: '{topic}'.\n\n"
+        f"Domain brief:\n{domain_brief[:500]}\n\n"
+        f"Research options to compare (implement each as a distinct strategy):\n{opt_lines}\n\n"
+        "Requirements:\n"
+        "1. Generate synthetic data appropriate to the domain — no file I/O, no external packages\n"
+        "2. Implement each option's mechanism as a named function\n"
+        "3. Run 25 independent trials per option; measure:\n"
+        "   - mean_quality: float in [0,1] representing solution quality\n"
+        "   - mean_cost: float representing relative compute cost\n"
+        "   - std_quality: standard deviation of quality across trials\n"
+        "4. Use only stdlib: random, math, statistics, json, hashlib\n"
+        "5. Use pow(x, n) instead of x**n — do NOT write ** anywhere\n"
+        "6. Do NOT write Python comments (no # lines)\n"
+        "7. End the script with exactly these three lines:\n"
+        "   print('COMPUTE_START')\n"
+        "   print(json.dumps({'results': [...list of dicts...]}))\n"
+        "   print('COMPUTE_END')\n"
+        "8. Each dict in 'results' must have keys: option_name, mean_quality, mean_cost, std_quality\n"
+        "9. Total runtime must be under 25 seconds\n"
+        "10. Return ONLY the Python code — no markdown fences, no explanation"
+    )
+    try:
+        response = call_llm(
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            model_id=MODEL_ID,
+            max_retries=2,
+        )
+        script = _text(response).strip()
+        if not script:
+            return {}
+        script = _sanitise_script(script)
+        output = run_code(script, filename="compute_experiment.py", timeout=60)
+        payload = _extract_json(output, "COMPUTE_START", "COMPUTE_END")
+        if isinstance(payload, dict) and isinstance(payload.get("results"), list) and payload["results"]:
+            return payload
+    except Exception:
+        pass
+    return {}
+
+
+def _sanitise_script(code: str) -> str:
+    """Strip markdown fences and replace ** to prevent extract_code_from_llm_response mangling."""
+    code = re.sub(r"^```[a-zA-Z]*\n?", "", code.strip())
+    if code.endswith("```"):
+        code = code[:-3].strip()
+    code = re.sub(r"(\w+)\s*\*\*\s*(\w+)", lambda m: f"pow({m.group(1)}, {m.group(2)})", code)
+    code = code.replace("**", " ")
+    return code
+
+
+# ---------------------------------------------------------------------------
 # Step 5: LLM reflects on results and proposes 2 refined options
 # ---------------------------------------------------------------------------
 
@@ -424,6 +489,7 @@ def _write_section(
     round2: list[dict],
     winner: dict,
     hits: list[dict],
+    compute: dict = None,
 ) -> str:
     """Single LLM call per section with all relevant evidence passed in."""
 
@@ -463,12 +529,22 @@ def _write_section(
             "3. Evaluation protocol: mechanism-aware simulated experiments, 40 trials each, "
             "composite Pareto score (1.55×accuracy + 1.15×stability − 0.55×cost − 0.07×steps)\n"
             "4. Refinement phase: LLM failure analysis on round-1 results, 2 improved options\n"
-            "5. Winner selection\n\n"
+            "5. Winner selection\n"
+            "6. Compute experiment: an LLM-generated Python script implemented each option's mechanism "
+            "on synthetic domain data and ran real calculations to produce quantitative per-option results\n\n"
             f"Round-1 options and mechanisms:\n{q_by_opt}\n"
             f"Round-2 had {len(refined)} refined options.\n\n"
             "Write only the section text. No heading. Be specific, not generic."
         )
     else:  # Results
+        compute_rows = ""
+        if compute and isinstance(compute, dict) and compute.get("results"):
+            rows = "\n".join(
+                f"  {r.get('option_name','?')}: quality={r.get('mean_quality',0):.4f}, "
+                f"cost={r.get('mean_cost',0):.4f}, std={r.get('std_quality',0):.4f}"
+                for r in compute["results"]
+            )
+            compute_rows = f"\n\nCompute experiment results (Python code ran on synthetic domain data):\n{rows}"
         prompt = (
             f"Write the Results (260–420 words) for a scientific paper on '{topic}'.\n\n"
             "Must:\n"
@@ -476,6 +552,7 @@ def _write_section(
             "- Describe what the refinement step changed and why (reference mechanism differences)\n"
             "- Report round-2 results and compare to round-1 top\n"
             "- Identify the winner, explain what made it best in terms of the domain problem\n"
+            "- If compute experiment results are provided, cite them alongside the Pareto scores\n"
             "- Connect the empirical pattern to the domain brief challenges\n"
             "- Note any unexpected findings or limitations\n\n"
             f"Round-1 results:\n{r1_table}\n\n"
@@ -483,7 +560,8 @@ def _write_section(
             f"Winner: {w.get('option_name','N/A')} (batch={w.get('batch','')}, "
             f"score={w.get('score',0)}, acc={w.get('macro_accuracy',0)}, "
             f"stab={w.get('macro_stability',0)}, cost={w.get('macro_cost',0)}, "
-            f"steps={w.get('macro_steps',0)})\n\n"
+            f"steps={w.get('macro_steps',0)})\n"
+            f"{compute_rows}\n\n"
             f"Domain brief excerpt: {domain_brief[:350]}\n\n"
             "Write only the section text. No heading. Preserve all exact numbers."
         )
@@ -551,7 +629,10 @@ def _fallback_section(section, topic, brief, options, r1, r2, winner):
             f"Phase 4 (refinement): the top-2 round-1 options were analysed for failure modes "
             f"and {len(r2)} improved options were generated. "
             f"Phase 5 (round-2 re-evaluation): the refined options were evaluated under the "
-            f"same 40-trial protocol, and the overall winner was selected by best composite score."
+            f"same 40-trial protocol, and the overall winner was selected by best composite score. "
+            f"Phase 6 (compute experiment): an LLM-generated Python script implemented each option's "
+            f"mechanism as a function operating on synthetic domain data, ran 25 independent trials "
+            f"per option, and reported mean quality, mean cost, and quality standard deviation."
         )
     w = winner
     r1_rows = "\n".join(
